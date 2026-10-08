@@ -1,0 +1,178 @@
+name: Bug Report 🐛
+description: Report a co-op multiplayer bug
+labels: ["(S1 - Need confirmation)"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! This is the **co-op multiplayer fork**, so the most useful
+        thing you can give us is the **log files from both players** — see below.
+
+  - type: textarea
+    id: description-of-bug
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what went wrong.
+      placeholder: After my partner finished their turn, the game stopped accepting my movement.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affected-side
+    attributes:
+      label: Which side did the bug appear on?
+      description: Who saw the problem — the player hosting the game, the player joining, or both?
+      options:
+        - Client (the joining player)
+        - Host (the player hosting)
+        - Both
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: versions
+    attributes:
+      label: Host & client versions
+      description: |
+        **Both players** check their build version (shown at the bottom of the main menu, and in the
+        version-mismatch popup if they differ). Paste both.
+        **If the two versions differ, that is very likely the bug** — both players must run the same build.
+      placeholder: |
+        host:   a1b2c3d
+        client: a1b2c3d
+    validations:
+      required: false
+
+  - type: textarea
+    id: game-report
+    attributes:
+      label: Game report (build, platform & enabled mods)
+      description: |
+        In the **main menu**, open Debug > Info > Generate Game Report and paste the output here. 
+        If the bug appeared on only one side, that player's report is enough.
+      placeholder: |
+        <paste the Generate Game Report output here>
+    validations:
+      required: false
+
+  - type: dropdown
+    id: network-setup
+    attributes:
+      label: Network setup
+      description: How were the two players connected?
+      options:
+        - Same machine (two windows or two monitors)
+        - LAN (same local network)
+        - WAN (direct over the internet)
+        - Tailscale / VPN
+        - Other (describe in Additional context)
+    validations:
+      required: true
+
+  - type: textarea
+    id: mp-logs
+    attributes:
+      label: Multiplayer logs (most important)
+      description: |
+        **This is the single most useful thing in the report.** Attach or paste both logs:
+
+        - **Host** the player hosting:
+          - macOS / Linux: `~/cdda-mp-server.log` (your home folder)
+          - Windows: `C:\Users\<name>\cdda-mp-server.log`
+        - **Client** the player joining:
+          - macOS / Linux: `~/cdda-mp-client.log` (your home folder)
+          - Windows: `C:\Users\<name>\cdda-mp-client.log`
+
+        Drag-and-drop the files directly into this box. If a player only has one of the
+        two logs, that's fine, paste what you have and say which side it's from.
+
+        **If logs are too big,** try zipping. For Windows: right-click > Send to > Compressed (zipped) folder.
+        For macOS / Linux run: `gzip cdda-mp-server.log` or right-click > Compress
+    validations:
+      required: true
+
+  - type: textarea
+    id: crash-logs
+    attributes:
+      label: Crash logs (if the game crashed)
+      description: |
+        **If the game crashed** (closed unexpectedly, froze, or showed a crash dialog), attach both
+        `crash.log` and `debug.log`. The co-op build is **portable** on Windows/Linux — the logs are
+        in a `config` folder **next to the game**, NOT in AppData (the crash dialog shows the relative
+        path `./config/debug.log` for this reason):
+
+        - **Windows:** `config\crash.log` and `config\debug.log` **inside the folder you unzipped**
+          (next to `cataclysm-tiles.exe`). There is no AppData folder for this build.
+        - **macOS:** `~/Library/Application Support/Cddacoop/config/crash.log` and `.../debug.log`
+          (in Finder: Go > Go to Folder… and paste `~/Library/Application Support/Cddacoop/config`).
+          Note it's **Cddacoop**, not Cataclysm — co-op keeps its own folder.
+        - **Linux:** `config/crash.log` and `config/debug.log` inside the `Cddacoop/` folder next to
+          the binary.
+
+        Drag-and-drop both files into this box. `crash.log` has the backtrace; `debug.log` has the
+        last actions before the crash — both help a lot. (`crash.log` only exists if there was a crash.)
+
+        **Windows minidump (optional, large):** the game also writes a `.core` minidump file **next
+        to `cataclysm-tiles.exe`**. It's big (tens of MB) and only useful if a developer asks for it —
+        the text `crash.log` above is the one we need first.
+      placeholder: Write N/A if the game did not crash.
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: As much as you, describe the actions taken that resulted in this bug
+      placeholder: |
+        1. Host starts a game, client joins.
+        2. Client walks next to a zombie and attacks.
+        3. On the client's screen the zombie both dies and leaves a standing corpse.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen, and ideally why.
+      placeholder: The zombie should die and leave a single corpse, the same on both screens.
+    validations:
+      required: true
+
+  - type: textarea
+    id: save-file
+    attributes:
+      label: Save file (optional)
+      description: |
+        Usually NOT needed: most co-op bugs are timing/sync issues that reproduce in any session.
+        Only attach a save if the bug depends on a **specific world, vehicle, or situation**, or if
+        the game **crashed**. There are two worlds in co-op (the host's and the client's), say which
+        save(s) you're attaching.
+      placeholder: Write N/A if not applicable.
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots / video
+      description: |
+        **If applicable.** Desync bugs (one screen disagrees with the other) are often much clearer
+        as a short screen recording or side-by-side screenshots of both players.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: |
+        Anything else. (If the game crashed, attach `crash.log` and `debug.log` in the
+        **Crash logs** field above.)
+      placeholder: |
+        - you can drag and drop files into this issue post
+    validations:
+      required: false

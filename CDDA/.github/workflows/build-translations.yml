@@ -1,0 +1,259 @@
+name: Build translations
+
+# Produces the compiled lang/mo + src/lang_stats.inc that every platform build
+# packages, from one of two sources:
+#
+#   1. Transifex (preferred, current) — needs a TX_TOKEN repo secret.
+#   2. This repo's own git history (fallback, frozen 2025-11-01) — needs nothing.
+#
+# Why a fallback exists at all: upstream CleverRaven/Cataclysm-DDA used to commit
+# real .po files straight into git. Commit 113d0f04af (2025-11-02, "Pull
+# translations in CI instead of using repo ones") replaced that with this
+# Transifex-at-build-time model, and 3f4b32df4f deleted the .po files a day
+# later. Our fork inherited the deletion through past merges but never the CI
+# half, so every release we have ever shipped has been English-only.
+#
+# The deletion commit is an ancestor of our master, which means every deleted
+# .po blob is still in our own repo's object store and reachable by SHA. That
+# is what PO_ARCHIVE_REF below points at. It is 28 languages, ~679 MB of .po,
+# compiling to ~170 MB of .mo, all of which compile cleanly under msgfmt.
+#
+# The fallback is deliberately not a replacement for Transifex. Those .po are
+# frozen at 2025-11-01 while our upstream base is 2026-06-10, so roughly seven
+# months of msgid drift means some newer strings fall back to English. Gettext
+# degrades per-string, not all-or-nothing, so this is "mostly translated"
+# rather than "broken" — but fresh Transifex data is strictly better whenever
+# TX_TOKEN is available.
+
+on:
+  workflow_dispatch:
+    inputs:
+      refresh_translations:
+        description: 'Pull fresh translations from Transifex (slow: ~45-60 min, 25 languages). Off = use the archived snapshot.'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      refresh_translations:
+        # Opt-in, and deliberately default-false even though TX_TOKEN exists.
+        # A Transifex pull is ~2 min and ~33 MB PER LANGUAGE, and the archive
+        # cache below is skipped whenever we take that path, so leaving it on
+        # would add the better part of an hour to every single release build
+        # and hammer a volunteer project's API 25x each time. The archived
+        # snapshot is good enough for day-to-day builds; tick this when you
+        # actually want fresher base translations.
+        type: boolean
+        default: false
+        required: false
+    secrets:
+      TX_TOKEN:
+        # Not required: without it the job takes the git-history path instead
+        # of failing. Marking it required would also break the caller, which
+        # passes an empty value when the secret does not exist.
+        required: false
+
+env:
+  # Parent of 3f4b32df4f "Delete translations from repo" — the last commit in
+  # our history that still has real lang/po/*.po content. Pinned by full SHA
+  # so this never silently drifts.
+  PO_ARCHIVE_REF: 3e3d267a0abfc25e49d06e4c224d2aec08fb7599
+
+jobs:
+  build-translations:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install gettext
+        run: sudo apt-get install gettext
+
+      - name: Install Transifex CLI
+        run: |
+          curl -sL https://github.com/transifex/cli/releases/download/v1.6.17/tx-linux-amd64.tar.gz | sudo tar zxvf - -C /usr/bin tx
+
+      - name: Checkout local repo
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          sparse-checkout: |
+            .tx
+            tools
+            lang
+          fetch-depth: 1
+
+      # Skipped unless the caller asked for it. The bare `exit 1` this step
+      # used to end on was harmless (continue-on-error) but rendered as a red
+      # ##[error] on every build, which reads as a broken job in the log view.
+      # It reports through an output now instead.
+      - name: Pull translations from Transifex
+        id: tx
+        if: inputs.refresh_translations
+        env:
+          TX_TOKEN: ${{ secrets.TX_TOKEN }}
+        run: |
+          if [ -z "${TX_TOKEN}" ]; then
+            echo "refresh_translations was requested but no TX_TOKEN secret is set —"
+            echo "falling back to the archived translations in git history."
+            exit 0
+          fi
+          tx pull -a --force -w 2
+
+      # placeholder.po is a tracked 0-byte file, so "did we get anything" has to
+      # mean "is there a non-empty .po", not "does lang/po contain a .po".
+      # A pull that half-succeeds (rate limit, expired token, network) can leave
+      # a handful of real .po behind, and this count would then happily accept
+      # them and ship a catalog far worse than the archive. Require most of the
+      # expected 25+ languages before trusting a pull.
+      - name: Decide translation source
+        id: source
+        run: |
+          count=$(find lang/po -name '*.po' -size +1k | wc -l)
+          echo "Non-empty .po files after Transifex pull: ${count}"
+          if [ "${count}" -gt 0 ] && [ "${count}" -lt 20 ]; then
+            echo "::warning::Only ${count} .po came down from Transifex (expected 25+)."
+            echo "::warning::Treating this as a failed pull and using the archive instead."
+            rm -f lang/po/*.po
+            count=0
+          fi
+          if [ "${count}" -gt 0 ]; then
+            echo "use_archive=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_archive=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The archived .po never change (they are pinned to one immutable SHA), so
+      # a hit here skips both the ~679 MB download and the compile entirely.
+      #
+      # The key must also cover lang/fork/*.po. A hit skips the layering step
+      # below along with everything else, so without the hash a translator's
+      # newly merged work would silently never reach a build.
+      - name: Restore archived translations from cache
+        id: archive-cache
+        if: steps.source.outputs.use_archive == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            lang/mo
+            src/lang_stats.inc
+          key: po-archive-${{ env.PO_ARCHIVE_REF }}-fork-${{ hashFiles('lang/fork/*.po') }}-v2
+
+      - name: Fetch archived translations from git history
+        if: >-
+          steps.source.outputs.use_archive == 'true'
+          && steps.archive-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "Fetching lang/po from ${GITHUB_REPOSITORY}@${PO_ARCHIVE_REF}"
+          # The Contents API pulls only the 28 files we need. A shallow git
+          # fetch of that commit would drag its entire tree (the whole game's
+          # data/ and src/) along for the ride.
+          names=$(gh api "repos/${GITHUB_REPOSITORY}/contents/lang/po?ref=${PO_ARCHIVE_REF}" \
+                    --jq '.[] | select(.name | endswith(".po")) | .name')
+          for n in ${names}; do
+            echo "  ${n}"
+            gh api -H "Accept: application/vnd.github.raw" \
+              "repos/${GITHUB_REPOSITORY}/contents/lang/po/${n}?ref=${PO_ARCHIVE_REF}" \
+              > "lang/po/${n}"
+          done
+          ls -la lang/po
+
+      # Upstream's lang/discard_invalid_po.sh is dead code now: it iterates
+      # `git diff --name-only lang/po/*.po`, but since the .po files were
+      # deleted from the repo, anything we pull or fetch is untracked and never
+      # shows up in a diff. Do the check it was meant to do, for real. Matters
+      # more for us than upstream — a truncated API response would otherwise
+      # reach msgfmt inside the platform builds and fail them there.
+      - name: Discard invalid translations
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        run: |
+          for f in lang/po/*.po; do
+            # placeholder.po is a tracked 0-byte file; left in place it compiles
+            # to an empty lang/mo/placeholder/ that nothing ever reads.
+            if [ ! -s "$f" ]; then echo "Dropping empty $f"; rm -f "$f"; continue; fi
+            msgfmt -o /dev/null "$f" 2>/dev/null || { echo "Discarding invalid $f"; rm -f "$f"; }
+          done
+
+      # Layer this fork's own translations over whatever the base source gave us.
+      # Upstream's Transifex catalog is upstream's; our added strings (the co-op
+      # UI, the CO-OP tips) can only ever come from lang/fork/<lang>.po, so they
+      # get merged in here, just before the compile.
+      #
+      # msgattrib --translated first is what makes this safe. The fork files
+      # ship with every msgstr blank until a volunteer fills them in, and
+      # `msgcat --use-first` prefers whatever the first file says — including a
+      # blank. Feeding it the raw fork file would let an untranslated fork entry
+      # erase a real upstream translation on any msgid the two happen to share.
+      # Filtering to translated-only entries makes a blank file a no-op, which
+      # is exactly what it should be.
+      #
+      # An invalid fork .po fails the build rather than being skipped. These are
+      # files we committed ourselves, so a broken one is our bug to fix before
+      # release — quietly dropping it would ship a release missing translations
+      # nobody noticed were gone.
+      - name: Layer in this fork's own translations
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          layered=0
+          for f in lang/fork/*.po; do
+            n=$(basename "$f" .po)
+            if ! msgfmt -o /dev/null "$f" 2>/dev/null; then
+              echo "::error::lang/fork/${n}.po is not a valid PO file"
+              exit 1
+            fi
+            # On a file with nothing translated, msgattrib writes no output at
+            # all — not even a header — and creates no file. So -s doubles as
+            # the "has anyone actually translated anything yet" test.
+            rm -f "/tmp/fork-${n}.po"
+            msgattrib --translated --no-obsolete "$f" -o "/tmp/fork-${n}.po" || true
+            if [ ! -s "/tmp/fork-${n}.po" ]; then
+              echo "lang/fork/${n}.po: nothing translated yet, skipping"
+              continue
+            fi
+            # grep counts the header's own msgid "" too, hence the -1 below.
+            count=$(grep -c '^msgid "' "/tmp/fork-${n}.po" || true)
+            if [ -f "lang/po/${n}.po" ]; then
+              msgcat --use-first "/tmp/fork-${n}.po" "lang/po/${n}.po" -o "/tmp/merged-${n}.po"
+              mv "/tmp/merged-${n}.po" "lang/po/${n}.po"
+              echo "lang/fork/${n}.po: layered $((count - 1)) strings onto the base translation"
+            else
+              # No base translation for this language at all. Ship the fork
+              # strings on their own rather than nothing — note the in-game
+              # percentage will read high, since it is computed against only
+              # the strings present.
+              cp "/tmp/fork-${n}.po" "lang/po/${n}.po"
+              echo "lang/fork/${n}.po: no base .po for ${n}, shipping $((count - 1)) fork strings alone"
+            fi
+            layered=$((layered + 1))
+          done
+          echo "Languages with fork translations layered in: ${layered}"
+
+      # Compile here rather than in each platform build: the .mo are ~170 MB
+      # against ~679 MB of .po, so shipping only the compiled output cuts what
+      # the three platform jobs each have to download by roughly 4x. The
+      # platform builds still pass LANGUAGES=all; with no .po present their
+      # `localization` target finds nothing to do and leaves this lang/mo
+      # in place.
+      - name: Compile translations
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        run: ./lang/compile_mo.sh all
+
+      - name: Update translation statistics
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        run: ./lang/update_stats.sh
+
+      - name: Report what was built
+        run: |
+          echo "Source: ${{ steps.source.outputs.use_archive == 'true' && 'archived git history' || 'Transifex' }}"
+          echo "Compiled languages:"
+          ls lang/mo 2>/dev/null || echo "  (none)"
+          du -sh lang/mo 2>/dev/null || true
+
+      - name: Store translation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "translations"
+          path: |
+            lang/mo
+            src/lang_stats.inc

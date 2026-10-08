@@ -1,0 +1,180 @@
+name: Test build
+
+# Private test builds: trigger via the Actions tab (workflow_dispatch) or by
+# pushing a tag matching test-*. Builds macOS always; Windows is opt-in
+# (slow) via the include_windows checkbox. Publishes a DRAFT GitHub Release
+# with the artifacts attached — visible only to repo collaborators.
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: 'Short label for this build (shown in the release body, no spaces)'
+        required: false
+        default: ''
+      include_windows:
+        description: 'Also build Windows (slow — adds ~25 min)'
+        type: boolean
+        default: false
+      windows_only:
+        description: 'Build ONLY Windows (skips macOS jobs; implies include_windows)'
+        type: boolean
+        default: false
+      mac_x64_only:
+        description: 'Build ONLY macOS Intel (skips macOS arm64 and Windows)'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'test-*'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  compute-version:
+    name: Compute version string
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          DATE="$(date -u +%Y%m%d)"
+          SHA="$(git rev-parse --short=7 HEAD)"
+          LABEL="${{ inputs.label }}"
+          if [ -n "${LABEL}" ]; then
+            VERSION="test-${DATE}-${SHA}-${LABEL}"
+          else
+            VERSION="test-${DATE}-${SHA}"
+          fi
+          # If triggered by a test-* tag, prefer the tag itself.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  build-mac:
+    name: Build macOS (${{ matrix.arch }})
+    needs: compute-version
+    if: inputs.windows_only != true
+    strategy:
+      fail-fast: false
+      # Matrix is dynamic: mac_x64_only trims it to just the Intel entry.
+      # (Job-level if: can't read matrix.*, so we filter at the matrix.)
+      matrix:
+        include: ${{ inputs.mac_x64_only && fromJSON('[{"runner":"macos-13","arch":"x64"}]') || fromJSON('[{"runner":"macos-14","arch":"arm64"},{"runner":"macos-13","arch":"x64"}]') }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/build-mac
+        with:
+          arch: ${{ matrix.arch }}
+          version: ${{ needs.compute-version.outputs.version }}
+
+  build-windows:
+    name: Build Windows (x64)
+    needs: compute-version
+    # Always build on a test-* tag push; otherwise gate on the dispatch input.
+    # mac_x64_only suppresses Windows entirely.
+    if: |
+      inputs.mac_x64_only != true &&
+      (startsWith(github.ref, 'refs/tags/test-') ||
+       inputs.include_windows == true ||
+       inputs.windows_only == true)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/build-windows
+        with:
+          version: ${{ needs.compute-version.outputs.version }}
+
+  draft-release:
+    name: Create draft release
+    needs: [compute-version, build-mac, build-windows]
+    # Need at least one platform to succeed; the other may be skipped.
+    if: |
+      always() &&
+      (needs.build-mac.result == 'success' || needs.build-mac.result == 'skipped') &&
+      (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
+      (needs.build-mac.result == 'success' || needs.build-windows.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        if: needs.build-mac.result == 'success' && inputs.mac_x64_only != true
+        with:
+          name: cddacoop-macos-arm64
+          path: dist/
+
+      - uses: actions/download-artifact@v4
+        if: needs.build-mac.result == 'success'
+        with:
+          name: cddacoop-macos-x64
+          path: dist/
+
+      - uses: actions/download-artifact@v4
+        if: needs.build-windows.result == 'success'
+        with:
+          name: cddacoop-windows-x64
+          path: dist/
+
+      - name: Stage CC-Sounds pack from repo
+        run: cp data/sound/CC-Sounds.zip dist/cc-sounds.zip
+
+      - name: Build commit list since last v*
+        id: changelog
+        run: |
+          LAST_TAG="$(git describe --tags --abbrev=0 --match='v*' 2>/dev/null || echo '')"
+          if [ -n "${LAST_TAG}" ]; then
+            RANGE="${LAST_TAG}..HEAD"
+            HEADER="Commits since ${LAST_TAG}:"
+          else
+            RANGE="HEAD"
+            HEADER="Recent commits:"
+          fi
+          {
+            echo "header<<EOF"
+            echo "${HEADER}"
+            echo "EOF"
+            echo "log<<EOF"
+            git log --pretty=format:'- %s (%h)' "${RANGE}" | head -50
+            echo
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.compute-version.outputs.tag }}
+          tag_name: ${{ needs.compute-version.outputs.tag }}
+          draft: true
+          prerelease: true
+          body: |
+            ## Test build ${{ needs.compute-version.outputs.version }}
+
+            Internal verification build — not for general release.
+            Windows build: ${{ needs.build-windows.result }}
+
+            ${{ steps.changelog.outputs.header }}
+
+            ${{ steps.changelog.outputs.log }}
+          files: |
+            dist/cddacoop-*-macos-arm64.zip
+            dist/cddacoop-*-macos-x64.zip
+            dist/cddacoop-*-windows-x64.zip
+            dist/cc-sounds.zip

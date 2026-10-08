@@ -1,0 +1,448 @@
+name: Release
+
+# Run name shown in the Actions tab: "[<platforms>] <summary>" for a dispatch,
+# or "[<platforms>] Release" if no summary / "[] Release" on a tag push.
+# Platforms are front-loaded so they survive the list-view truncation; the full
+# SHA is dropped (it bloated the title and pushed platforms off-screen — the
+# commit is shown in the run details, and the release title carries the short SHA).
+# Uses github.event.inputs.* (strings) to match the if:-condition style below.
+run-name: "[${{ github.event.inputs.mac == 'true' && 'mac ' || '' }}${{ github.event.inputs.windows == 'true' && 'win ' || '' }}${{ github.event.inputs.linux == 'true' && 'linux' || '' }}] ${{ github.event.inputs.summary || 'Release' }}"
+
+# Build selected platforms, then optionally upload to a per-build release on
+# GitHub. Triggered by tag push (all platforms) or manual dispatch with
+# platform toggles.
+#
+# Each preview build → its own release `preview-<sha7>`. The releases page
+# becomes the build archive — players who need to pair with a friend on an
+# older sig can grab the matching build. The site (cddacoop.com) always
+# fetches the newest non-draft release via the GitHub API, so the homepage
+# download auto-points at the freshest build.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      mac:
+        description: 'Build macOS (universal — arm64 + Intel in one binary)'
+        type: boolean
+        default: true
+      windows:
+        description: 'Build Windows x64'
+        type: boolean
+        default: true
+      linux:
+        description: 'Build Linux x64'
+        type: boolean
+        default: true
+      upload:
+        description: 'Upload to preview release on site'
+        type: boolean
+        default: false
+      draft:
+        description: 'Make the release a DRAFT (collaborator-only; not public, not on the site — download from the release page or run artifacts while logged in). Needs Upload checked too.'
+        type: boolean
+        default: false
+      refresh_translations:
+        description: 'Pull fresh base translations from Transifex first (SLOW: adds ~45-60 min). Leave off unless you want newer upstream translations.'
+        type: boolean
+        default: false
+      summary:
+        description: 'Short headline for this build — one major fix/feature. Shown in the release title and the Actions run name (e.g. "co-op join fix"). Optional.'
+        type: string
+        default: ''
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write  # create releases, upload assets
+
+jobs:
+  setup:
+    name: Compute build version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release_name: ${{ steps.v.outputs.release_name }}
+    steps:
+      - name: Compute version
+        id: v
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          IN_MAC: ${{ github.event.inputs.mac }}
+          IN_WIN: ${{ github.event.inputs.windows }}
+          IN_LINUX: ${{ github.event.inputs.linux }}
+          SUMMARY: ${{ github.event.inputs.summary }}
+        run: |
+          # Always use the short commit SHA as the build identifier — this is
+          # what the binary stamps into its VERSION string and what the in-game
+          # version handshake compares.  Using the tag name here caused the
+          # site download label to say "v1.0.2" while in-game said "dc7c514e",
+          # confusing players trying to verify they're on matching builds.
+          VER="${SHA:0:10}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Build version: $VER"
+
+          # Human-readable release TITLE (display only; tag_name stays $VER so the
+          # site + in-game handshake keep keying on the SHA). Shape:
+          #   "<platforms> — <summary> (<sha>)"  e.g. "mac+win — co-op join fix (336832ac58)"
+          # Tag push: "<tag> (<sha>)". No summary: just "<platforms> (<sha>)".
+          if [ "$REF_TYPE" = "tag" ]; then
+            REL="$REF_NAME ($VER)"
+          else
+            PLATS=""
+            [ "$IN_MAC" = "true" ]   && PLATS="${PLATS:+$PLATS+}mac"
+            [ "$IN_WIN" = "true" ]   && PLATS="${PLATS:+$PLATS+}win"
+            [ "$IN_LINUX" = "true" ] && PLATS="${PLATS:+$PLATS+}linux"
+            [ -z "$PLATS" ] && PLATS="build"
+            if [ -n "$SUMMARY" ]; then
+              REL="$PLATS — $SUMMARY ($VER)"
+            else
+              REL="$PLATS ($VER)"
+            fi
+          fi
+          echo "release_name=$REL" >> "$GITHUB_OUTPUT"
+          echo "Release name: $REL"
+
+  # Hands every platform build the same compiled lang/mo + src/lang_stats.inc.
+  # Prefers fresh translations from Transifex (needs a TX_TOKEN repo secret);
+  # without that secret it falls back to the archived .po still reachable in
+  # this repo's own git history, so releases ship translated either way.
+  # See build-translations.yml for the full story.
+  build-translations:
+    name: Build translations
+    uses: ./.github/workflows/build-translations.yml
+    with:
+      refresh_translations: ${{ inputs.refresh_translations == true }}
+    secrets:
+      TX_TOKEN: ${{ secrets.TX_TOKEN }}
+
+  build-mac:
+    name: Build macOS (universal)
+    needs: [setup, build-translations]
+    # One universal (arm64 + x86_64) binary built on Apple Silicon. Replaces
+    # the old per-arch arm64 + macos-13 Intel jobs: the macOS SDK on macos-14
+    # carries both slices and the SDL2 frameworks are universal, so a single
+    # fat binary runs natively on both architectures. This removes the
+    # dependency on the deprecated macos-13 Intel runner.
+    if: >-
+      github.ref_type == 'tag'
+      || github.event.inputs.mac == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch translations artifact into build
+        uses: actions/download-artifact@v4
+        with:
+          name: translations
+
+      - uses: ./.github/actions/build-mac
+        with:
+          arch: universal
+          version: ${{ needs.setup.outputs.version }}
+
+  build-windows:
+    name: Build Windows (x64)
+    needs: [setup, build-translations]
+    if: >-
+      github.ref_type == 'tag'
+      || github.event.inputs.windows == 'true'
+    # windows-2022: the runner upstream's msvc-full-features.yml targets.
+    runs-on: windows-2022
+    # Env mirrors upstream's msvc-full-features.yml. VCPKG_OVERLAY_TRIPLETS
+    # points at our merged x64-windows-static.cmake (release-only, mpg123
+    # forced dynamic). CDDA_* drive the ccache shim wired up in the action.
+    env:
+      BACKTRACE: 1
+      CCACHE_LIMIT: 10GB
+      CDDA_CCACHE_PATH: ${{ github.workspace }}\ccache\
+      CDDA_USE_CCACHE: true
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\.github\vcpkg_triplets
+      CCACHE_HARDLINK: true
+      ZSTD_CLEVEL: 17
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch translations artifact into build
+        uses: actions/download-artifact@v4
+        with:
+          name: translations
+
+      - uses: ./.github/actions/build-windows
+        with:
+          version: ${{ needs.setup.outputs.version }}
+
+  build-linux:
+    name: Build Linux (x64)
+    needs: [setup, build-translations]
+    if: >-
+      github.ref_type == 'tag'
+      || github.event.inputs.linux == 'true'
+    # SDL2-for-now: apt libsdl2-dev on 22.04 keeps the glibc baseline broad
+    # (lower than 24.04) so the binary runs on more distros. (SDL3 era bumped
+    # this to 24.04 to build SDL3 from source; reverted with the SDL2 switch.)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch translations artifact into build
+        uses: actions/download-artifact@v4
+        with:
+          name: translations
+
+      - uses: ./.github/actions/build-linux
+        with:
+          version: ${{ needs.setup.outputs.version }}
+
+  upload:
+    name: Publish release
+    needs: [setup, build-mac, build-windows, build-linux]
+    # Run if upload was requested or it's a tag push. Allow skipped deps
+    # (platform wasn't selected) — only fail on actual failure.
+    if: >-
+      !failure() && !cancelled()
+      && (github.event.inputs.upload == 'true' || github.ref_type == 'tag')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/ || echo "No artifacts"
+
+      # The CC-Sounds pack (~135 MB) is stripped from the platform bundles to
+      # keep downloads slim; the launcher fetches it on first run. The full
+      # pack lives tracked at data/sound/CC-Sounds/ (the build actions delete it
+      # from the bundle, but this upload job has a clean checkout). Zip it from
+      # inside data/sound/ so the archive root is CC-Sounds/ — that's exactly
+      # what the launcher unzips into .../Cddacoop/sound/.
+      - name: Stage CC-Sounds pack
+        run: |
+          mkdir -p dist
+          ( cd data/sound && zip -rqy ../../dist/cc-sounds.zip CC-Sounds )
+          ls -lh dist/cc-sounds.zip
+
+      - name: Build release body
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          # Find the most recent prior preview release tag so we can scope
+          # "what changed" to commits since then. Falls back to last 10
+          # commits if no prior preview exists (first-ever build, or all
+          # previews pruned). Tagged v* releases get the auto-generated
+          # changelog appended below; we still list recent commits here for
+          # consistency.
+          PREV=$(gh release list -R "$REPO" --limit 30 \
+                   --json tagName,isPrerelease \
+                   --jq '.[] | select(.isPrerelease == true and (.tagName | startswith("preview-"))) | .tagName' \
+                 | grep -v "^${VERSION}\$" \
+                 | head -1 || true)
+
+          if [ -n "$PREV" ] && git rev-parse --verify "refs/tags/$PREV" >/dev/null 2>&1; then
+            CHANGES=$(git log --format="- %s" "$PREV..HEAD" | head -20)
+            COMPARE="commits since [\`$PREV\`](https://github.com/$REPO/releases/tag/$PREV)"
+          else
+            CHANGES=$(git log --format="- %s" -10 HEAD)
+            COMPARE="last 10 commits"
+          fi
+          [ -z "$CHANGES" ] && CHANGES="- (no new commits)"
+
+          # Heredoc into the body file. Don't quote 'EOF' — we want $VAR
+          # expansion. Backticks need escaping; raw URLs are fine.
+          cat > /tmp/body.md <<EOF
+          **Built:** $BUILD_DATE
+          **SHA:** \`$(git rev-parse --short HEAD)\` (matches the version line shown on the main menu and the zip filename)
+
+          ## What changed ($COMPARE)
+
+          $CHANGES
+
+          ## Downloads
+
+          - **macOS (Apple Silicon + Intel)** — \`cddacoop-${VERSION}-macos-universal.zip\`
+          - **Windows x64** — \`cddacoop-${VERSION}-windows-x64.zip\`
+          - **Linux x64** — \`cddacoop-${VERSION}-linux-x64.tar.gz\` (extract, run \`./cddacoop.sh\`; built on Ubuntu 22.04 / glibc 2.35+)
+          - **CC-Sounds pack** — \`cc-sounds.zip\` (the .app prompts on first launch to download this)
+
+          The macOS zip is a universal binary — one download runs natively on
+          both Apple Silicon and Intel Macs (macOS 10.15+).
+          macOS zips contain \`Cddacoop.app\` + \`README.txt\`.
+          Unsigned — first launch on macOS needs **right-click → Open**;
+          Windows SmartScreen needs **More info → Run anyway**.
+
+          ---
+
+          Co-op partners must run **matching builds** — the in-game version
+          handshake rejects mismatched sigs. The short SHA on the main menu
+          matches the SHA in the zip filename, so your friend can pick the
+          right build from the [releases page](https://github.com/$REPO/releases).
+          EOF
+
+          echo "=== body.md ==="
+          cat /tmp/body.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Display title is the descriptive name; tag_name stays the SHA so the
+          # site API lookup and the in-game version handshake are unaffected.
+          name: ${{ needs.setup.outputs.release_name }}
+          tag_name: ${{ needs.setup.outputs.version }}
+          # Draft = collaborator-only, not public, and the site filters it out
+          # (releases.filter(!draft)). Set via the `draft` dispatch input; tag
+          # pushes (inputs.draft empty) stay non-draft/public.
+          draft: ${{ github.event.inputs.draft == 'true' }}
+          # NEVER publish a public PRE-RELEASE. Policy (set 2026-07-08): the
+          # public /releases list must show only the currently-live site build
+          # and previously-live ones — never RC/preview. So a build is either a
+          # DRAFT (collaborator-only QA; the `draft` input) or, once published, a
+          # FULL release (which is what goes live on the site + itch). Tagged v*
+          # is likewise a full release. The old `ref_type != 'tag'` rule made
+          # every Upload-checked dispatch a public pre-release — the leak that
+          # put RC builds like d466057/30cdb72 on the public list.
+          prerelease: false
+          # Auto-generated notes are appended below body for tagged
+          # releases — they reflect a real cross-version changelog window.
+          # Previews already list "what changed" above.
+          generate_release_notes: ${{ github.ref_type == 'tag' }}
+          body_path: /tmp/body.md
+          files: |
+            dist/cddacoop-*-macos-universal.zip
+            dist/cddacoop-*-windows-x64.zip
+            dist/cddacoop-*-linux-x64.tar.gz
+            dist/cc-sounds.zip
+
+      # Mirror the same artifacts to itch.io (cddacoop.itch.io/cddacoop) so the
+      # itch listing stays pinned to this commit alongside the site. Pushes the
+      # UNZIPPED contents per platform channel: butler diffs at the file level,
+      # so the unchanged data/tiles/sound (hundreds of MB) upload once and each
+      # preview only re-sends the changed binary — and itch-app users get patch
+      # auto-updates. The binary inside is the same commit either way, so itch
+      # builds still pass the in-game version handshake against site builds.
+      # Additive and non-critical: a missing key or an itch outage no-ops and
+      # never blocks the GitHub release or the site rebuild below.
+      # Skip for draft releases — same reasoning as "Trigger site rebuild"
+      # below: drafts are internal QA/preview builds, not public releases, and
+      # itch should only ever see the same public-release cadence as the site.
+      # (Previously ungated: every draft RC dispatch during a bug-fixing sprint
+      # was pushing to itch and spamming followers with a "new build" per
+      # commit — caught 2026-07-07 via a wall of itch notifications.)
+      - name: Push builds to itch.io
+        if: ${{ github.event.inputs.draft != 'true' }}
+        continue-on-error: true
+        env:
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          ITCH_TARGET: cddacoop/cddacoop
+        run: |
+          if [ -z "$BUTLER_API_KEY" ]; then
+            echo "BUTLER_API_KEY not set — skipping itch.io push"
+            exit 0
+          fi
+
+          # Fetch butler (itch.io's official upload tool).
+          curl -sL -o butler.zip https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default
+          unzip -q butler.zip
+          chmod +x butler
+          ./butler -V
+
+          # Unzip one artifact into a clean staging dir, then push that dir to
+          # its itch channel. Skips silently if the platform wasn't built in
+          # this run (partial dispatch) — matching the site's per-platform
+          # fallback, so itch and the site stay on the same per-platform commit.
+          push() {
+            archive_glob="$1"; channel="$2"; stage="$3"
+            file=$(ls $archive_glob 2>/dev/null | head -1 || true)
+            if [ -z "$file" ]; then
+              echo "no artifact for $channel ($archive_glob) — skipping"
+              return 0
+            fi
+            rm -rf "$stage" && mkdir -p "$stage"
+            case "$file" in
+              *.zip)    unzip -q "$file" -d "$stage" ;;
+              *.tar.gz) tar -xzf "$file" -C "$stage" ;;
+            esac
+            echo "=== pushing $channel from $file ==="
+            ./butler push "$stage" "$ITCH_TARGET:$channel" --userversion "$VERSION"
+          }
+
+          push "dist/cddacoop-*-macos-universal.zip" mac     stage/mac
+          push "dist/cddacoop-*-windows-x64.zip"     windows stage/windows
+          push "dist/cddacoop-*-linux-x64.tar.gz"    linux   stage/linux
+
+          ./butler status "$ITCH_TARGET" || true
+
+      # Kick the site rebuild directly. We can't rely on notify-site.yml's
+      # `release: published` trigger here: this release is created by the
+      # default GITHUB_TOKEN, and GitHub deliberately does NOT fire workflow
+      # events for token-created releases (recursion guard). So the site would
+      # stay pinned at the previous build's (now-deleted) download URL until a
+      # manual nudge. Dispatch catacoop-site's deploy ourselves with the PAT.
+      # notify-site.yml still covers manual `gh release edit` asset swaps,
+      # which fire under a human PAT and so trigger the event normally.
+      - name: Trigger site rebuild
+        # Skip for draft releases — the site filters drafts out, so a rebuild
+        # would either no-op or (worse) re-pin to an older non-draft build.
+        if: ${{ github.event.inputs.draft != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          gh workflow run deploy.yml \
+            --repo busterbogheart/catacoop-site \
+            --ref main
+
+  prune-caches:
+    name: Prune stale ccaches
+    # GitHub caps the repo's Actions-cache at 10 GB and LRU-evicts when over.
+    # The mac ccache is ~1.77 GB and accrued one-per-SHA (5 retained = ~8.8 GB),
+    # crowding out the tiny (0.1-0.15 GB) win/linux caches — which is what made
+    # the next Windows build a 53-min cold compile (0% ccache hits, 2026-06-26).
+    # Keep only the newest ccache per platform; the restore-key prefix always
+    # restores the newest and each build re-saves it, so older ones are dead
+    # weight. Runs after every build regardless of outcome; never fails the run.
+    needs: [build-mac, build-windows, build-linux]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write   # gh cache delete
+      contents: read
+    steps:
+      - name: Delete superseded ccaches (keep newest per platform)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          for prefix in ccache-mac-universal- ccache-win-x64-v2- ccache-linux-x64-; do
+            echo "=== $prefix ==="
+            ids=$(gh cache list -R "$REPO" --limit 100 --json id,key,createdAt \
+              -q "[.[] | select(.key|startswith(\"$prefix\"))] | sort_by(.createdAt) | reverse | .[1:] | .[].id")
+            for id in $ids; do
+              echo "deleting superseded cache id=$id"
+              gh cache delete "$id" -R "$REPO" || true
+            done
+          done
+          echo "=== remaining cache budget (GB) ==="
+          gh cache list -R "$REPO" --limit 100 --json sizeInBytes \
+            -q '[.[].sizeInBytes]|add // 0 | ./1e9'

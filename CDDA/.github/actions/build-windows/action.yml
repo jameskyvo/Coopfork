@@ -1,0 +1,203 @@
+name: Build Windows binary
+description: >
+  Build cataclysm-tiles.exe via MSYS2/MinGW-w64, walk DLL deps with ntldd,
+  package into Cddacoop/ folder, zip, and upload as
+  cddacoop-windows-x64.
+
+inputs:
+  version:
+    description: 'Version string baked into the binary (e.g. v0.1.0 or test-20260523-a1b2c3d).'
+    required: true
+
+outputs:
+  zip-path:
+    description: 'Filesystem path of the produced ZIP, relative to the repo root.'
+    value: ${{ steps.package.outputs.zip-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up MSYS2 / MinGW-w64
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: false
+        cache: true
+        install: >-
+          base-devel
+          git
+          mingw-w64-x86_64-toolchain
+          mingw-w64-x86_64-SDL2
+          mingw-w64-x86_64-SDL2_image
+          mingw-w64-x86_64-SDL2_mixer
+          mingw-w64-x86_64-SDL2_ttf
+          mingw-w64-x86_64-gettext
+          mingw-w64-x86_64-libxmp
+          mingw-w64-x86_64-wavpack
+          mingw-w64-x86_64-opusfile
+          mingw-w64-x86_64-opus
+          mingw-w64-x86_64-ntldd
+          mingw-w64-x86_64-ccache
+          zip
+
+    - name: Restore ccache
+      uses: actions/cache@v4
+      with:
+        # Cache a path under the workspace, NOT ~/.ccache: this step runs in the
+        # default Windows shell where ~ is C:\Users\runneradmin, but the build
+        # runs in the MSYS2 shell where $HOME is C:\msys64\home\... — a different
+        # dir. The mismatch meant the cache only ever saved an empty folder, so
+        # the Windows build got 0% ccache hits and full-recompiled every run.
+        path: ${{ github.workspace }}/ccache
+        key: ccache-win-x64-v2-${{ github.sha }}
+        restore-keys: |
+          ccache-win-x64-v2-
+        save-always: true
+
+    - name: Configure ccache
+      shell: msys2 {0}
+      run: |
+        # CCACHE_DIR must point at the SAME physical dir the cache action saves.
+        # ccache is a MinGW binary (wants a Windows path); msys2 coreutils want a
+        # unix path. cygpath bridges the two.
+        CCDIR="$(cygpath -u "$GITHUB_WORKSPACE")/ccache"
+        mkdir -p "$CCDIR"
+        echo "CCACHE_DIR=$(cygpath -w "$CCDIR")" >> "$GITHUB_ENV"
+        echo "CCACHE_MAXSIZE=2G" >> "$GITHUB_ENV"
+        ccache -z
+
+    - name: Strip CC-Sounds for slim ZIP
+      shell: msys2 {0}
+      run: |
+        rm -rf data/sound/CC-Sounds data/sound/CC-Sounds.zip
+        # Hide these tracked-file deletions from git's dirty check so the
+        # build-time version (getVersionString) stays the clean commit hash,
+        # identical to the mac/intel builds. Otherwise the Makefile appends
+        # "-dirty.<HHMMSS>" and the MP version handshake never matches across
+        # separately-built binaries.
+        git ls-files -d -z | git update-index --assume-unchanged -z --stdin
+
+    - name: Write version header
+      shell: msys2 {0}
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        printf '#pragma once\n#define CDDACOOP_VERSION "%s"\n' "$VERSION" \
+          > src/cata_version_generated.h
+
+    - name: Build cataclysm-tiles.exe
+      shell: msys2 {0}
+      run: |
+        # BACKTRACE=1 compiles the dbghelp-based crash handler (src/debug.cpp,
+        # links -ldbghelp) so a segfault writes a symbolicated crash.log. The
+        # Makefile declines to auto-enable it on MSYS2 ("headers probably not
+        # available") — testing that assumption; dbghelp.h ships with MinGW-w64.
+        make -j$(nproc) \
+          MSYS2=1 CCACHE=1 STATIC=1 \
+          TILES=1 SOUND=1 SDL3=0 LINTJSON=0 PCH=0 \
+          RELEASE=1 BACKTRACE=1 \
+          LOCALIZE=1 LANGUAGES=all \
+          cataclysm-tiles.exe localization
+
+    - name: ccache stats
+      shell: msys2 {0}
+      run: ccache -s
+
+    - name: Smoke test — load game data headless (--check-mods)
+      shell: msys2 {0}
+      run: |
+        # Catch data/mod-load crashes before they ship. --check-mods sets
+        # test_mode=true → loads core + default mods and exits, no SDL window.
+        # STATIC build, run from repo root with data/ present. Advisory for now
+        # (never fails the build) while we validate the harness on real runners.
+        set +e
+        timeout 300 ./cataclysm-tiles.exe --check-mods dda 2>&1 | tail -40
+        rc=${PIPESTATUS[0]}
+        echo "SMOKE EXIT: $rc"
+        if [ "$rc" = "0" ]; then
+          echo "SMOKE: PASS"
+        else
+          echo "::warning title=Smoke test::--check-mods exited $rc (advisory)"
+        fi
+        # DIAG (temp): segfault/exit-1 in headless --check-mods — dump debug.log
+        # (errors go there, not stdout) to see what the runner actually logged.
+        echo "=== debug.log dump (diagnose smoke exit) ==="
+        find . -maxdepth 4 -name debug.log 2>/dev/null | while read -r f; do
+          echo "--- $f ---"; cat "$f"; echo
+        done
+
+    - name: Split debug symbols + strip (shrink public binary)
+      shell: msys2 {0}
+      run: |
+        # RELEASE=1 normally strips, but BACKTRACE=1 tells the Makefile to KEEP
+        # symbols (Makefile:1280-1287) so the dbghelp crash handler can resolve
+        # them — that's the ~3x size jump vs the old MSVC build, whose symbols
+        # lived in an unbundled .pdb. Split the symbols into a sidecar we archive
+        # for server-side symbolization (addr2line on crash.log addresses) and
+        # ship a stripped binary: the "ship stripped, symbolize server-side"
+        # model. Player crash.logs carry raw addresses we resolve against the
+        # sidecar. before/after sizes are printed so the win is visible in CI.
+        ls -lh cataclysm-tiles.exe | awk '{print "STRIP before:", $5}'
+        objcopy --only-keep-debug cataclysm-tiles.exe cataclysm-tiles.exe.debug
+        strip --strip-all cataclysm-tiles.exe
+        objcopy --add-gnu-debuglink=cataclysm-tiles.exe.debug cataclysm-tiles.exe
+        ls -lh cataclysm-tiles.exe       | awk '{print "STRIP after: ", $5}'
+        ls -lh cataclysm-tiles.exe.debug | awk '{print "STRIP debug: ", $5}'
+
+    - name: Package ZIP
+      id: package
+      shell: msys2 {0}
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        mkdir -p Cddacoop
+        cp cataclysm-tiles.exe Cddacoop/
+        bash build-data/md-to-readme-txt.sh build-data/README-cddacoop.md > Cddacoop/README.txt
+        # CC-BY-SA: ship the full license text (+ third-party sub-licenses)
+        # alongside the binary, not just the README's license link.
+        cp LICENSE.txt Cddacoop/
+        cp -r data gfx Cddacoop/
+        # SOUND=1 still wants the sound/ tree for menu sounds; the
+        # CC-Sounds pack proper is downloaded by the user later.
+        [ -d data/sound ] && cp -r data/sound Cddacoop/data/ || true
+        # Translations: path_info.cpp resolves lang/mo/ as a sibling of the
+        # binary, same as data/ and gfx/ above.
+        if [ -d lang/mo ]; then mkdir -p Cddacoop/lang && cp -r lang/mo Cddacoop/lang/; fi
+
+        # Walk transitive DLL deps from the .exe and copy each one in.
+        # ntldd output line format:
+        #   <name>.dll => <path> (0x...)
+        # grep for mingw64 to drop system DLLs we shouldn't bundle.
+        # With STATIC=1 the .exe pulls everything in statically, so ntldd
+        # returns only Windows system DLLs and grep finds zero matches.
+        # The `|| true` on grep keeps msys2's pipefail from killing the
+        # script in that case; xargs with no input is a no-op.
+        ntldd -R Cddacoop/cataclysm-tiles.exe \
+          | { grep -i mingw64 || true; } \
+          | awk '{print $3}' \
+          | sed 's|\\|/|g' \
+          | sort -u \
+          | xargs -I{} cp {} Cddacoop/
+
+        ZIP="cddacoop-${VERSION}-windows-x64.zip"
+        zip -r "$ZIP" Cddacoop
+        echo "zip-path=${ZIP}" >> "$GITHUB_OUTPUT"
+
+    - name: Upload ZIP artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: cddacoop-windows-x64
+        path: ${{ steps.package.outputs.zip-path }}
+        retention-days: 30
+        if-no-files-found: error
+
+    # The split-off debug symbols — archived, NOT shipped in the release zip.
+    # Pair with a player's crash.log addresses (addr2line / gdb) to recover
+    # function + line. Keep these for every public build you symbolize against.
+    - name: Upload debug symbols (archived for crash symbolization)
+      uses: actions/upload-artifact@v4
+      with:
+        name: cddacoop-windows-x64-debug
+        path: cataclysm-tiles.exe.debug
+        retention-days: 90
+        if-no-files-found: warn

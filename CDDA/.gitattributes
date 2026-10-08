@@ -1,0 +1,48 @@
+# Automatically normalize line endings for all files
+# detected as text (Convert CRLF => LF).
+*         text=auto
+
+# Explicitly normalize files with these extensions in
+# case Git doesn't detect them as text for some reason.
+*.c       text
+*.cbp     text
+*.cpp     text
+*.h       text
+*.json    text
+*.md      text
+*.py      text
+*.rc      text
+*.sh      text
+*.txt     text
+*.yml     text
+
+# Visual Studio project files, leave them alone.
+*.cmd     -text
+*.filters -text
+*.sln     -text
+*.user    -text
+*.vcxproj -text
+
+# Generated translation text, don't mess with them.
+*.mo      binary
+*.po      -text -diff
+*.pot     -text
+
+# ...except this fork's own catalogs. The rule above exists because upstream's
+# .po were tens of megabytes of machine-managed Transifex output that nobody
+# reviews. Ours are ~24 KB, hand-edited by volunteers, and reviewed in pull
+# requests — and "-diff" makes GitHub treat them as binary, which hides the
+# diff AND blocks its web editor, the one route that lets a translator
+# contribute without installing anything.
+lang/fork/*.po   text diff
+lang/fork/*.pot  text diff
+
+# Treat images, archives, and font files as binary.
+# (binary is a macro for -text -diff)
+*.db      binary
+*.fon     binary
+*.gz      binary
+*.ico     binary
+*.png     binary
+*.ttf     binary
+
