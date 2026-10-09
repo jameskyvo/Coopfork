@@ -61,11 +61,6 @@ const std::map<std::string, coop_entry> &coop_table()
             }
         },
         {
-            "magiclysm", { mod_coop::incompatible,
-                translate_marker( "CO-OP: NOT COMPATIBLE.  Leans heavily on teleport spells and scripted (effect-on-condition) effects that don't apply to the remote player, and long-range teleports break the shared map." )
-            }
-        },
-        {
             "mindovermatter", { mod_coop::incompatible,
                 translate_marker( "CO-OP: NOT COMPATIBLE.  Psionic powers are scripted and run only on your own client; teleportation powers break the shared map and self-heals desync from the host." )
             }
